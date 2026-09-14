@@ -1,0 +1,39 @@
+{
+  "name": "rawsift",
+  "version": "0.1.0",
+  "description": "Fast, verified photo culling and ingest for photographers",
+  "license": "MIT",
+  "author": "RawSift contributors",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MIGO-OvO/RawSift.git"
+  },
+  "homepage": "https://github.com/MIGO-OvO/RawSift#readme",
+  "bugs": {
+    "url": "https://github.com/MIGO-OvO/RawSift/issues"
+  },
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:web": "vite",
+    "build": "tauri build",
+    "build:web": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
+  }
+}
+

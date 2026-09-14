@@ -1,0 +1,119 @@
+name: Release
+
+# Builds installers for every supported platform and attaches them to a GitHub
+# Release. Pushing a tag such as `v0.1.0` triggers the full matrix; the manual
+# dispatch entry point rebuilds an existing tag without creating a new one.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows 64-bit: NSIS setup + WiX MSI
+          - name: Windows x64
+            platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+
+          # Windows 32-bit (ia32): NSIS setup + WiX MSI
+          - name: Windows 32-bit
+            platform: windows-latest
+            target: i686-pc-windows-msvc
+            args: --target i686-pc-windows-msvc
+
+          # One universal binary covers both Intel Macs and Apple silicon.
+          - name: macOS universal
+            platform: macos-latest
+            target: universal-apple-darwin
+            args: --target universal-apple-darwin
+
+          # Linux x64: deb, rpm and AppImage
+          - name: Linux x64
+            platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build bundles and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "RawSift ${{ github.event.inputs.tag || github.ref_name }}"
+          releaseBody: |
+            RawSift ${{ github.event.inputs.tag || github.ref_name }} — early development preview.
+
+            Download the installer for your platform from the assets below.
+
+            | Platform | Asset |
+            | --- | --- |
+            | Windows 10/11 (64-bit) | `RawSift_*_x64-setup.exe` / `RawSift_*_x64_en-US.msi` |
+            | Windows 10/11 (32-bit) | `RawSift_*_x86-setup.exe` / `RawSift_*_x86_en-US.msi` |
+            | macOS (Intel + Apple silicon) | `RawSift_*_universal.dmg` |
+            | Linux (x64) | `.deb` / `.rpm` / `.AppImage` |
+
+            macOS builds are unsigned. If Gatekeeper blocks the app, run
+            `xattr -cr /Applications/RawSift.app` once after copying it to Applications.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

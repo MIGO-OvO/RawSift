@@ -1,0 +1,37 @@
+[package]
+name = "rawsift"
+version = "0.1.0"
+description = "Fast, verified photo culling and ingest"
+authors = ["RawSift contributors"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/MIGO-OvO/RawSift"
+homepage = "https://github.com/MIGO-OvO/RawSift"
+readme = "../README.md"
+
+[lib]
+name = "rawsift_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+blake3 = "1.8.7"
+chrono = { version = "0.4.45", features = ["serde"] }
+jpeg-decoder = "0.3.2"
+kamadak-exif = "0.6.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.11.5", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.7.3"
+thiserror = "2.0.20"
+uuid = { version = "1.26.0", features = ["serde", "v4"] }
+walkdir = "2.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Storage_FileSystem", "Win32_System_Com", "Win32_Devices_PortableDevices"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
