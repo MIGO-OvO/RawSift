@@ -100,6 +100,9 @@ jobs:
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "RawSift ${{ github.event.inputs.tag || github.ref_name }}"
+          # RawSift does not ship an auto-updater yet, so no updater JSON or
+          # signing key is involved. Enable both when the updater plugin lands.
+          includeUpdaterJson: false
           releaseBody: |
             RawSift ${{ github.event.inputs.tag || github.ref_name }} — early development preview.
 
