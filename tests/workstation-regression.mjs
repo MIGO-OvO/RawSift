@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 import { installNativeCallbacks } from './native-mock.mjs';
 
 const browser = await chromium.launch({ headless: true, ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
@@ -178,7 +178,11 @@ try {
   assert(Math.abs(synced[0].zoom - synced[1].zoom) < 0.01, 'Both images share zoom');
   await comparison.getByRole('button', { name: '适应窗口', exact: true }).click();
   await comparison.getByRole('button', { name: '选择 B', exact: true }).click();
-  if (await comparison.getByRole('button', { name: '上一组胶片', exact: true }).isEnabled()) await comparison.getByRole('button', { name: '上一组胶片', exact: true }).click();
+  await expect(comparison.locator('.film-frame.active')).toHaveAttribute('title', gridNames[3].slice(0,8));
+  await comparison.getByRole('button', { name: '下一组胶片', exact: true }).click();
+  await expect(comparison.getByRole('button', { name: '上一组胶片', exact: true })).toBeEnabled();
+  await comparison.getByRole('button', { name: '上一组胶片', exact: true }).click();
+  assert.equal(await comparison.locator('.compare-caption strong').nth(1).textContent(), gridNames[3].slice(0,8), 'Paging keeps the selected comparison photo');
   await comparison.locator(`.film-frame[title="${gridNames[2].slice(0,8)}"]`).click();
   assert.equal(await comparison.locator('.compare-caption strong').nth(1).textContent(), gridNames[2].slice(0,8));
   for (const viewport of [{width:1024,height:640},{width:800,height:560},{width:3840,height:2160}]) {

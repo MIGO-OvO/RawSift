@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PhotoPreview } from "./PhotoPreview";
 import { demoScan } from "./demo";
 import { histogramFromImageUrl, histogramPaths } from "./histogram";
@@ -924,7 +924,9 @@ function GridView({ captures, currentId, onOpen, onCompare, statusFor, rotations
 function Filmstrip({ captures, currentId, onSelect, statusFor, rotations, compareIds }: { captures: Capture[]; currentId: string | null; onSelect: (id: string) => void; compareIds?: [string | null, string | null]; statusFor: (id: string) => ReviewStatus; rotations: Record<string, number> }) {
   const currentIndex = captures.findIndex((capture) => capture.id === currentId);
   const [start, setStart] = useState(0);
-  useEffect(() => setStart(Math.max(0, currentIndex - 6)), [currentIndex, captures]);
+  // Selecting the other comparison slot must reveal its page before painting;
+  // otherwise paging controls briefly describe the previous slot's page.
+  useLayoutEffect(() => setStart(Math.max(0, currentIndex - 6)), [currentIndex, captures]);
   const visible = captures.slice(start, start + 14);
   return (
     <nav className="filmstrip" aria-label="照片胶片条">
