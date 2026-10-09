@@ -34,6 +34,8 @@ pub struct SessionSnapshot {
     pub auto_advance: bool,
     pub reviews: HashMap<String, ReviewStatus>,
     pub transfers: HashMap<String, PersistedTransfer>,
+    #[serde(default)]
+    pub pending_batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +74,7 @@ pub enum TransferStatus {
     Verified,
     Committed,
     Failed,
+    Cancelled,
 }
 
 impl TransferStatus {
@@ -83,6 +86,7 @@ impl TransferStatus {
             Self::Verified => "verified",
             Self::Committed => "committed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -94,6 +98,7 @@ impl TransferStatus {
             "verified" => Some(Self::Verified),
             "committed" => Some(Self::Committed),
             "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -125,6 +130,19 @@ pub struct TransferUpdate {
 
 pub struct SessionStore {
     connection: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportBatch {
+    pub batch_id: String,
+    pub session_id: String,
+    pub source_root: String,
+    pub destination: String,
+    pub import_mode: String,
+    pub capture_ids: Vec<String>,
+    pub files: Vec<crate::ingest::CommittedFile>,
+    pub completed_at: String,
 }
 
 impl SessionStore {
@@ -175,8 +193,22 @@ impl SessionStore {
             );
             CREATE INDEX IF NOT EXISTS sessions_status_updated
                 ON sessions(status, updated_at DESC);
-            PRAGMA user_version = 1;",
+            CREATE TABLE IF NOT EXISTS import_batches (
+                batch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                receipt TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            PRAGMA user_version = 2;",
         )?;
+        let has_batch_column: bool = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'pending_batch_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_batch_column {
+            connection.execute_batch("ALTER TABLE sessions ADD COLUMN pending_batch_id TEXT;")?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -192,8 +224,8 @@ impl SessionStore {
             "INSERT INTO sessions (
                 session_id, source_root, recursive, active_date, current_capture_id,
                 destination_root, shoot_name, import_mode, show_info, show_histogram,
-                auto_advance, status, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12)
+                auto_advance, status, updated_at, pending_batch_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12, ?13)
             ON CONFLICT(session_id) DO UPDATE SET
                 source_root = excluded.source_root,
                 recursive = excluded.recursive,
@@ -205,7 +237,8 @@ impl SessionStore {
                 show_info = excluded.show_info,
                 show_histogram = excluded.show_histogram,
                 auto_advance = excluded.auto_advance,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                pending_batch_id = CASE WHEN EXISTS (SELECT 1 FROM import_batches WHERE batch_id = excluded.pending_batch_id) THEN sessions.pending_batch_id ELSE excluded.pending_batch_id END",
             params![
                 snapshot.session_id,
                 snapshot.source_root,
@@ -219,6 +252,7 @@ impl SessionStore {
                 snapshot.show_histogram,
                 snapshot.auto_advance,
                 now(),
+                snapshot.pending_batch_id,
             ],
         )?;
         Ok(())
@@ -292,6 +326,17 @@ impl SessionStore {
     }
 
     pub fn load_latest_active(&self) -> Result<Option<SessionSnapshot>, StoreError> {
+        self.load_active(None)
+    }
+
+    pub fn load_latest_for_source(
+        &self,
+        root: &str,
+    ) -> Result<Option<SessionSnapshot>, StoreError> {
+        self.load_active(Some(root))
+    }
+
+    fn load_active(&self, root: Option<&str>) -> Result<Option<SessionSnapshot>, StoreError> {
         let connection = self
             .connection
             .lock()
@@ -300,12 +345,12 @@ impl SessionStore {
             .query_row(
                 "SELECT session_id, source_root, recursive, active_date, current_capture_id,
                         destination_root, shoot_name, import_mode, show_info, show_histogram,
-                        auto_advance
+                        auto_advance, pending_batch_id
                  FROM sessions
-                 WHERE status = 'active'
+                 WHERE status = 'active' AND (?1 IS NULL OR source_root = ?1)
                  ORDER BY updated_at DESC
                  LIMIT 1",
-                [],
+                [root],
                 |row| {
                     Ok(SessionSnapshot {
                         session_id: row.get(0)?,
@@ -321,6 +366,7 @@ impl SessionStore {
                         auto_advance: row.get(10)?,
                         reviews: HashMap::new(),
                         transfers: HashMap::new(),
+                        pending_batch_id: row.get(11)?,
                     })
                 },
             )
@@ -366,6 +412,7 @@ impl SessionStore {
         Ok(session)
     }
 
+    #[cfg(test)]
     pub fn mark_committed(&self, session_id: &str) -> Result<(), StoreError> {
         validate_session_id(session_id)?;
         let connection = self
@@ -378,10 +425,81 @@ impl SessionStore {
         )?;
         Ok(())
     }
+
+    pub fn save_import_batch(&self, batch: &ImportBatch) -> Result<(), StoreError> {
+        validate_session_id(&batch.batch_id)?;
+        validate_session_id(&batch.session_id)?;
+        let receipt = serde_json::to_string(batch).expect("serializable receipt");
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute("INSERT INTO import_batches(batch_id, session_id, receipt, completed_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(batch_id) DO UPDATE SET receipt = excluded.receipt", params![batch.batch_id, batch.session_id, receipt, batch.completed_at])?;
+        for id in &batch.capture_ids {
+            transaction.execute("INSERT INTO transfers(session_id, capture_id, status, progress, error, updated_at) VALUES (?1, ?2, 'committed', 1, NULL, ?3) ON CONFLICT(session_id, capture_id) DO UPDATE SET status = 'committed', progress = 1, error = NULL, updated_at = excluded.updated_at", params![batch.session_id, id, now()])?;
+        }
+        transaction.execute(
+            "UPDATE sessions SET pending_batch_id = ?2, updated_at = ?3 WHERE session_id = ?1",
+            params![batch.session_id, Uuid::new_v4().to_string(), now()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_import_batch(&self, id: &str) -> Result<Option<ImportBatch>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let json: Option<String> = connection
+            .query_row(
+                "SELECT receipt FROM import_batches WHERE batch_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|e| {
+                StoreError::Database(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                ))
+            })
+        })
+        .transpose()
+    }
+
+    pub fn load_import_history(&self) -> Result<Vec<ImportBatch>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let mut statement = connection
+            .prepare("SELECT receipt FROM import_batches ORDER BY completed_at DESC LIMIT 100")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut batches = Vec::new();
+        for row in rows {
+            let json = row?;
+            let batch = serde_json::from_str(&json).map_err(|e| {
+                StoreError::Database(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                ))
+            })?;
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
 }
 
 fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), StoreError> {
     validate_session_id(&snapshot.session_id)?;
+    if let Some(batch) = &snapshot.pending_batch_id {
+        validate_session_id(batch)?;
+    }
     if !matches!(snapshot.import_mode.as_str(), "jpeg" | "raw" | "jpeg+raw") {
         return Err(StoreError::InvalidImportMode(snapshot.import_mode.clone()));
     }
@@ -421,7 +539,55 @@ mod tests {
             auto_advance: true,
             reviews: HashMap::new(),
             transfers: HashMap::new(),
+            pending_batch_id: None,
         }
+    }
+
+    #[test]
+    fn batches_preserve_active_review_and_atomic_completed_capture_records() {
+        let store = store();
+        let session = snapshot();
+        store.save_session(&session).unwrap();
+        for id in ["photo-a", "photo-b"] {
+            let batch = ImportBatch {
+                batch_id: Uuid::new_v4().to_string(),
+                session_id: session.session_id.clone(),
+                source_root: session.source_root.clone(),
+                destination: "F:/Photos".to_owned(),
+                import_mode: "raw".to_owned(),
+                capture_ids: vec![id.to_owned()],
+                files: Vec::new(),
+                completed_at: Utc::now().to_rfc3339(),
+            };
+            store.save_import_batch(&batch).unwrap();
+            store.save_import_batch(&batch).unwrap(); // same receipt is idempotent
+        }
+        let active = store.load_latest_active().unwrap().unwrap();
+        assert_eq!(active.session_id, session.session_id);
+        assert_eq!(
+            active.transfers["photo-a"].status,
+            TransferStatus::Committed
+        );
+        assert_eq!(
+            active.transfers["photo-b"].status,
+            TransferStatus::Committed
+        );
+        assert_eq!(store.load_import_history().unwrap().len(), 2);
+        let other = SessionSnapshot {
+            session_id: Uuid::new_v4().to_string(),
+            source_root: "G:/DCIM".to_owned(),
+            ..snapshot()
+        };
+        store.save_session(&other).unwrap();
+        assert_eq!(
+            store
+                .load_latest_for_source(&session.source_root)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            session.session_id
+        );
+        assert_eq!(store.load_import_history().unwrap().len(), 2);
     }
 
     #[test]

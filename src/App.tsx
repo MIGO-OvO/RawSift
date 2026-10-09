@@ -7,21 +7,22 @@ import {
   chooseAndScanSource,
   chooseDestination,
   commitSession,
-  confirmCommit,
   discoverPhotoDevices,
   imageUrl,
   isDesktopRuntime,
   loadLastSession,
+  loadSourceSession,
+  loadImportHistory,
   loadPreviewHistogram,
-  removeTransferState,
   saveReviewUpdate,
   saveSessionSnapshot,
-  saveTransferUpdate,
   scanLocalSource,
-  stageCapture,
-  unstageCapture,
 } from "./native";
-import type { PhotoDevice } from "./native";
+import type { ImportBatch, PhotoDevice } from "./native";
+import { useIngestController } from "./hooks/useIngestController";
+import { Modal, Toast, Progress, ImportResult } from "./components/feedback";
+import { WindowControls } from "./components/WindowControls";
+import { CompareView } from "./components/CompareView";
 import type {
   Capture,
   ImportMode,
@@ -202,11 +203,9 @@ function App() {
   const [scan, setScan] = useState<ScanResult | null>(() => (isDesktopRuntime() ? null : demoScan));
   const [busy, setBusy] = useState(() => isDesktopRuntime());
   const [sessionReady, setSessionReady] = useState(() => !isDesktopRuntime());
-  const [sessionCommitted, setSessionCommitted] = useState(false);
   const [activeDate, setActiveDate] = useState<string>(() => demoScan.dateGroups[0]?.dateKey ?? "");
   const [currentId, setCurrentId] = useState<string | null>(() => demoScan.captures[0]?.id ?? null);
   const [reviews, setReviews] = useState<Record<string, ReviewStatus>>({});
-  const [transfers, setTransfers] = useState<Record<string, TransferState>>({});
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("single");
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [importMode, setImportMode] = useState<ImportMode>("raw");
@@ -223,6 +222,15 @@ function App() {
   const [showDevices, setShowDevices] = useState(false);
   const [finishing, setFinishing] = useState(false);
   const [restoreAttempt, setRestoreAttempt] = useState(0);
+  const [showCommitConfirm, setShowCommitConfirm] = useState(false);
+  const [commitProgress, setCommitProgress] = useState<import("./types").TransferProgress | null>(null);
+  const [resultBatch, setResultBatch] = useState<ImportBatch | null>(null);
+  const [history, setHistory] = useState<ImportBatch[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [compareIds, setCompareIds] = useState<[string | null, string | null]>([null, null]);
+  const [compareSlot, setCompareSlot] = useState<0 | 1>(0);
+  const [comparePicker, setComparePicker] = useState<0 | 1 | null>(null);
   const sourceOperation = useRef(false);
   const commitInFlight = useRef(false);
   const pendingSource = useRef<string | null>(null);
@@ -236,6 +244,14 @@ function App() {
   const undoStack = useRef<Array<{ id: string; previous: ReviewStatus }>>([]);
   const reviewsRef = useRef(reviews);
   const sessionId = useRef<string>(crypto.randomUUID());
+  const [pendingBatchId, setPendingBatchId] = useState<string>(() => crypto.randomUUID());
+  const { transfers, setTransfers, updateTransfer, paused, pause, retry, batchId, nextBatch, workerBusy } = useIngestController({
+    sessionId: sessionId.current, sourceRoot: scan?.sourceRoot ?? "", destinationRoot, importMode,
+    pendingBatchId, onBatchChange: setPendingBatchId,
+    ready: sessionReady && !busy && !finishing && !sourceDisconnected, captures: scan?.captures ?? [], reviews, onError: setError,
+  });
+  const transferBusy = workerBusy || Object.values(transfers).some(state => state.status === "copying" || state.status === "verifying");
+  useEffect(() => { void loadImportHistory().then(value => setHistory(value ?? [])).catch(reason => setError(`导入历史读取失败：${String(reason)}`)); }, []);
 
   useEffect(() => {
     reviewsRef.current = reviews;
@@ -259,8 +275,8 @@ function App() {
           Object.entries(saved.reviews).filter(([captureId]) => captureIds.has(captureId)),
         );
         const restoredTransfers: Record<string, TransferState> = {};
-        for (const [captureId, status] of Object.entries(restoredReviews)) {
-          if (status !== "keep") continue;
+        for (const captureId of Object.keys(saved.transfers)) {
+          if (!captureIds.has(captureId)) continue;
           restoredTransfers[captureId] = saved.transfers[captureId]?.status === "committed"
             ? { status: "committed", progress: 1 }
             : { status: "queued", progress: 0 };
@@ -274,6 +290,7 @@ function App() {
           : restoredScan.captures.find((capture) => capture.dateKey === restoredDate)?.id ?? null;
 
         sessionId.current = saved.sessionId;
+        setPendingBatchId(saved.pendingBatchId ?? saved.sessionId);
         reviewsRef.current = restoredReviews;
         setScan(restoredScan);
         setActiveDate(restoredDate);
@@ -343,7 +360,9 @@ function App() {
   }, [capturesForDate, filter, statusFor, transfers]);
 
   const currentIndex = Math.max(0, visibleCaptures.findIndex((capture) => capture.id === currentId));
-  const current = visibleCaptures[currentIndex] ?? visibleCaptures[0] ?? null;
+  const current = workspaceMode === "compare" && compareIds[compareSlot]
+    ? scan?.captures.find(capture => capture.id === compareIds[compareSlot]) ?? null
+    : visibleCaptures[currentIndex] ?? visibleCaptures[0] ?? null;
 
   const rotateCurrent = useCallback((delta: number) => {
     if (!current?.previewPath) return;
@@ -373,27 +392,28 @@ function App() {
   );
 
   const queuedBytes = useMemo(
-    () => kept.reduce((sum, capture) => {
+    () => kept.filter(capture => transfers[capture.id]?.status !== "committed").reduce((sum, capture) => {
       if (importMode === "jpeg") return sum + (capture.jpeg?.sizeBytes ?? 0);
       if (importMode === "raw") return sum + (capture.raw?.sizeBytes ?? 0);
       return sum + (capture.jpeg?.sizeBytes ?? 0) + (capture.raw?.sizeBytes ?? 0);
     }, 0),
-    [importMode, kept],
+    [importMode, kept, transfers],
   );
 
   const relativeFolder = useMemo(() => {
     const year = activeDate.slice(0, 4) || new Date().getFullYear().toString();
     const safeName = shootName.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-");
-    return `${year}\\${activeDate}${safeName ? `_${safeName}` : ""}`;
+    return `${year}/${activeDate}${safeName ? `_${safeName}` : ""}`;
   }, [activeDate, shootName]);
 
-  const finalPath = destinationRoot ? `${destinationRoot.replace(/[\\/]$/, "")}\\${relativeFolder}` : null;
+  const finalPath = destinationRoot ? `${destinationRoot.replace(/[\\/]$/, "")}${destinationRoot.includes("\\") ? "\\" : "/"}${destinationRoot.includes("\\") ? relativeFolder.replaceAll("/", "\\") : relativeFolder}` : null;
 
   useEffect(() => {
-    if (!isDesktopRuntime() || !sessionReady || sessionCommitted || !scan) return;
+    if (!isDesktopRuntime() || !sessionReady || !scan) return;
     const timer = window.setTimeout(() => {
       void saveSessionSnapshot({
         sessionId: sessionId.current,
+        pendingBatchId,
         sourceRoot: scan.sourceRoot,
         recursive: true,
         activeDate,
@@ -413,12 +433,12 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [
     activeDate,
+    pendingBatchId,
     autoAdvance,
     currentId,
     destinationRoot,
     importMode,
     scan,
-    sessionCommitted,
     sessionReady,
     shootName,
     showHistogram,
@@ -427,7 +447,7 @@ function App() {
 
   const openSource = useCallback(async (root?: string) => {
     if (sourceOperation.current || commitInFlight.current) return;
-    if (Object.values(transfers).some(transfer => transfer.status === "copying" || transfer.status === "verifying")) {
+    if (workerBusy || Object.values(transfers).some(transfer => transfer.status === "copying" || transfer.status === "verifying")) {
       setError("照片正在复制或校验，请等待完成后再切换来源。");
       return;
     }
@@ -436,33 +456,45 @@ function App() {
     setSessionReady(false);
     setError(null);
     try {
+      if (scan) await saveSessionSnapshot({ sessionId: sessionId.current, pendingBatchId, sourceRoot: scan.sourceRoot, recursive: true,
+        activeDate, currentCaptureId: currentId, destinationRoot, shootName, importMode, showInfo, showHistogram, autoAdvance, reviews: {}, transfers: {} });
       const result = root ? await scanLocalSource(root, true) : await chooseAndScanSource(true);
       if (!result) return;
+      if (result.sourceRoot === scan?.sourceRoot) { setScan(result); setShowDevices(false); return; }
+      const saved = await loadSourceSession(result.sourceRoot);
       pendingSource.current = null;
       setShowDevices(false);
       setFilter("all");
-      const newSessionId = crypto.randomUUID();
-      const firstDate = result.dateGroups[0]?.dateKey ?? "";
-      const firstCaptureId = result.captures.find((capture) => capture.dateKey === firstDate)?.id ?? null;
+      const newSessionId = saved?.sessionId ?? crypto.randomUUID();
+      const captureIds = new Set(result.captures.map(capture => capture.id));
+      const restoredReviews = Object.fromEntries(Object.entries(saved?.reviews ?? {}).filter(([id]) => captureIds.has(id)));
+      const restoredTransfers = Object.fromEntries(Object.entries(saved?.transfers ?? {}).filter(([id]) => captureIds.has(id)).map(([id, state]) => [id, state.status === "committed" ? state : { status: "queued", progress: 0 } as TransferState]));
+      const firstDate = saved && result.dateGroups.some(group => group.dateKey === saved.activeDate) ? saved.activeDate : result.dateGroups[0]?.dateKey ?? "";
+      const firstCaptureId = saved?.currentCaptureId && captureIds.has(saved.currentCaptureId) ? saved.currentCaptureId : result.captures.find((capture) => capture.dateKey === firstDate)?.id ?? null;
       sessionId.current = newSessionId;
+      setPendingBatchId(saved?.pendingBatchId ?? saved?.sessionId ?? crypto.randomUUID());
       setScan(result);
       setActiveDate(firstDate);
       setCurrentId(firstCaptureId);
-      reviewsRef.current = {};
-      setReviews({});
-      setTransfers({});
-      setShootName("");
-      setSessionCommitted(false);
+      reviewsRef.current = restoredReviews;
+      setReviews(restoredReviews);
+      setTransfers(restoredTransfers);
+      setShootName(saved?.shootName ?? "");
+      if (saved) { setDestinationRoot(saved.destinationRoot); setImportMode(saved.importMode); }
+      setCompareIds([null, null]);
+      setComparePicker(null);
+      setWorkspaceMode("single");
       undoStack.current = [];
       await saveSessionSnapshot({
         sessionId: newSessionId,
+        pendingBatchId: saved?.pendingBatchId ?? saved?.sessionId,
         sourceRoot: result.sourceRoot,
         recursive: true,
         activeDate: firstDate,
         currentCaptureId: firstCaptureId,
-        destinationRoot,
-        shootName: "",
-        importMode,
+        destinationRoot: saved?.destinationRoot ?? destinationRoot,
+        shootName: saved?.shootName ?? "",
+        importMode: saved?.importMode ?? importMode,
         showInfo,
         showHistogram,
         autoAdvance,
@@ -476,7 +508,7 @@ function App() {
       setBusy(false);
       setSessionReady(true);
     }
-  }, [autoAdvance, destinationRoot, importMode, showHistogram, showInfo, transfers]);
+  }, [activeDate, autoAdvance, currentId, destinationRoot, importMode, pendingBatchId, scan, shootName, showHistogram, showInfo, transfers, workerBusy]);
 
   useEffect(() => {
     if (!scan) return;
@@ -509,68 +541,18 @@ function App() {
     if (!visibleCaptures.length) return;
     const next = Math.max(0, Math.min(visibleCaptures.length - 1, currentIndex + delta));
     setCurrentId(visibleCaptures[next]!.id);
-  }, [currentIndex, visibleCaptures]);
-
-  const updateTransfer = useCallback((captureId: string, transfer: TransferState | null) => {
-    setTransfers((value) => {
-      const next = { ...value };
-      if (transfer) next[captureId] = transfer;
-      else delete next[captureId];
-      return next;
+    if (workspaceMode === "compare") setCompareIds(value => {
+      const pair: [string | null, string | null] = [...value];
+      const id = visibleCaptures[next]!.id;
+      const other = compareSlot === 0 ? 1 : 0;
+      if (pair[other] === id) pair[other] = pair[compareSlot];
+      pair[compareSlot] = id;
+      return pair;
     });
-    const persistence = transfer
-      ? saveTransferUpdate(sessionId.current, captureId, transfer)
-      : removeTransferState(sessionId.current, captureId);
-    void persistence.catch((reason) => {
-      setError(`队列状态保存失败：${reason instanceof Error ? reason.message : String(reason)}`);
-    });
-  }, []);
-
-  const stageOne = useCallback(async (capture: Capture, requestedMode: ImportMode = importMode) => {
-    updateTransfer(capture.id, { status: "copying", progress: 0.35 });
-    if (!destinationRoot) {
-      updateTransfer(capture.id, { status: "queued", progress: 0 });
-      return;
-    }
-    if (!isDesktopRuntime()) {
-      window.setTimeout(() => {
-        if (reviewsRef.current[capture.id] === "keep") {
-          updateTransfer(capture.id, { status: "verified", progress: 1 });
-        }
-      }, 480);
-      return;
-    }
-    try {
-      await stageCapture({
-        captureId: capture.id,
-        destinationRoot,
-        sessionId: sessionId.current,
-        importMode: requestedMode,
-      });
-      if (reviewsRef.current[capture.id] === "keep") {
-        updateTransfer(capture.id, { status: "verified", progress: 1 });
-      }
-    } catch (reason) {
-      updateTransfer(capture.id, {
-        status: "failed",
-        progress: 0,
-        error: reason instanceof Error ? reason.message : String(reason),
-      });
-    }
-  }, [destinationRoot, importMode, updateTransfer]);
-
-  const unstageOne = useCallback(async (capture: Capture) => {
-    updateTransfer(capture.id, null);
-    if (!destinationRoot || !isDesktopRuntime()) return;
-    try {
-      await unstageCapture(capture.id, destinationRoot, sessionId.current);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }, [destinationRoot, updateTransfer]);
+  }, [compareSlot, currentIndex, visibleCaptures, workspaceMode]);
 
   const mark = useCallback((status: ReviewStatus) => {
-    if (!current || !sessionReady || sessionCommitted) return;
+    if (!current || !sessionReady) return;
     const previous = statusFor(current.id);
     if (previous === status) return;
     undoStack.current.push({ id: current.id, previous });
@@ -580,17 +562,16 @@ function App() {
     void saveReviewUpdate(sessionId.current, current.id, status).catch((reason) => {
       setError(`审片状态保存失败：${reason instanceof Error ? reason.message : String(reason)}`);
     });
-    if (status === "keep") {
+    if (status === "keep" && transfers[current.id]?.status !== "committed") {
       updateTransfer(current.id, { status: "queued", progress: 0 });
-      void stageOne(current);
     } else {
-      void unstageOne(current);
+      if (transfers[current.id]?.status !== "committed") updateTransfer(current.id, null);
     }
-    if (autoAdvance && status !== "unreviewed") navigate(1);
-  }, [autoAdvance, current, navigate, sessionCommitted, sessionReady, stageOne, statusFor, unstageOne, updateTransfer]);
+    if (autoAdvance && status !== "unreviewed" && workspaceMode !== "compare") navigate(1);
+  }, [autoAdvance, current, navigate, sessionReady, statusFor, transfers, updateTransfer, workspaceMode]);
 
   const undo = useCallback(() => {
-    if (!sessionReady || sessionCommitted) return;
+    if (!sessionReady) return;
     const latest = undoStack.current.pop();
     if (!latest) return;
     const nextReviews = { ...reviewsRef.current, [latest.id]: latest.previous };
@@ -601,15 +582,15 @@ function App() {
     });
     setCurrentId(latest.id);
     const capture = scan?.captures.find((item) => item.id === latest.id);
-    if (capture && latest.previous === "keep") {
+    if (capture && latest.previous === "keep" && transfers[capture.id]?.status !== "committed") {
       updateTransfer(capture.id, { status: "queued", progress: 0 });
-      void stageOne(capture);
     } else if (capture) {
-      void unstageOne(capture);
+      if (transfers[capture.id]?.status !== "committed") updateTransfer(capture.id, null);
     }
-  }, [scan, sessionCommitted, sessionReady, stageOne, unstageOne, updateTransfer]);
+  }, [scan, sessionReady, transfers, updateTransfer]);
 
   const pickDestination = useCallback(async () => {
+    if (commitInFlight.current || sourceOperation.current) return;
     try {
       const selected = await chooseDestination();
       if (!selected) return;
@@ -620,66 +601,79 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!destinationRoot || !sessionReady || sessionCommitted) return;
-    for (const capture of kept) {
-      if (!transfers[capture.id] || transfers[capture.id]?.status === "queued") {
-        void stageOne(capture);
-      }
-    }
-  }, [destinationRoot, kept, sessionCommitted, sessionReady, stageOne, transfers]);
-
   const changeImportMode = useCallback((mode: ImportMode) => {
-    if (commitInFlight.current) return;
-    if (mode === importMode || sessionCommitted) return;
-    setImportMode(mode);
-    for (const capture of kept) {
-      updateTransfer(capture.id, { status: "queued", progress: 0 });
-      void stageOne(capture, mode);
-    }
-  }, [importMode, kept, sessionCommitted, stageOne, updateTransfer]);
+    if (!commitInFlight.current && !sourceOperation.current) setImportMode(mode);
+  }, []);
 
-  const finishImport = useCallback(async () => {
-    if (commitInFlight.current || sessionCommitted || !kept.length || !kept.every(capture => transfers[capture.id]?.status === "verified")) return;
-    if (!destinationRoot) {
-      await pickDestination();
-      return;
-    }
-    if (!isDesktopRuntime()) {
-      setNotice(`演示会话已就绪：${kept.length} 次拍摄将提交到 ${finalPath}`);
-      return;
-    }
+  const pendingKept = kept.filter(capture => transfers[capture.id]?.status !== "committed");
+  const finishImport = () => {
+    if (!commitInFlight.current && destinationRoot && pendingKept.length && pendingKept.every(capture => transfers[capture.id]?.status === "verified")) setShowCommitConfirm(true);
+  };
+  const performCommit = async () => {
+    if (commitInFlight.current || !destinationRoot || !scan || !pendingKept.length) return;
     commitInFlight.current = true;
     setFinishing(true);
-    setSessionReady(false);
     setError(null);
+    setCommitProgress(null);
+    const batch = batchId.current;
+    const captures = pendingKept;
+    const reviewSession = sessionId.current;
     try {
-      if (!await confirmCommit(kept.length, finalPath ?? destinationRoot)) return;
-      const result = await commitSession(
-        destinationRoot,
-        sessionId.current,
-        relativeFolder,
-        kept.map((capture) => capture.id),
-        importMode,
-      );
-      for (const capture of kept) updateTransfer(capture.id, { status: "committed", progress: 1 });
-      setSessionCommitted(true);
+      const result = await commitSession(destinationRoot, batch, relativeFolder, captures.map(capture => capture.id), importMode,
+        reviewSession, scan.sourceRoot, detail => { if (detail.operationId === batch) setCommitProgress(detail); });
+      for (const capture of captures) updateTransfer(capture.id, { status: "committed", progress: 1 });
+      const receipt: ImportBatch = { batchId: batch, sessionId: reviewSession, sourceRoot: scan.sourceRoot,
+        destination: finalPath ?? destinationRoot, importMode, captureIds: captures.map(capture => capture.id), files: result.files, completedAt: new Date().toISOString() };
+      setHistory(value => [receipt, ...value.filter(item => item.batchId !== batch)]);
+      setResultBatch(receipt);
+      setShowCommitConfirm(false);
+      nextBatch();
       setNotice(`导入完成：${result.files.length} 个文件已提交并验证。`);
       if (result.persistenceWarning) setError(result.persistenceWarning);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setShowCommitConfirm(false);
+      setError(`完成导入失败，可重试：${String(reason)}`);
     } finally {
       commitInFlight.current = false;
       setFinishing(false);
-      setSessionReady(true);
     }
-  }, [destinationRoot, finalPath, importMode, kept, pickDestination, relativeFolder, updateTransfer, sessionCommitted, transfers]);
+  };
+  const assignCompare = (id: string, slot: 0 | 1 = compareSlot) => {
+    setCompareSlot(slot);
+    setCompareIds(value => { const next: [string | null, string | null] = [...value];
+      const other = slot === 0 ? 1 : 0;
+      if (next[other] === id) next[other] = next[slot];
+      next[slot] = id; return next;
+    });
+    setCurrentId(id);
+    setComparePicker(null);
+  };
+  useEffect(() => {
+    if (workspaceMode !== "compare" || !current) return;
+    setCompareIds(value => value[0] ? value : [current.id, scan?.captures.find(item => item.id !== current.id)?.id ?? null]);
+  }, [workspaceMode, current, scan]);
+  const feedback = <>
+    {error && <Toast key={error} error message={error} onClose={() => setError(null)} />}
+    {notice && !error && <Toast key={notice} message={notice} onClose={() => setNotice(null)} />}
+    {showCommitConfirm && <Modal title={finishing ? "正在完成导入" : "确认完成导入"} locked={finishing} onClose={() => setShowCommitConfirm(false)}
+      footer={!finishing && <><button className="secondary" type="button" onClick={() => setShowCommitConfirm(false)} autoFocus>继续审片</button><button className="primary" type="button" onClick={() => void performCommit()}>完成导入</button></>}>
+      {finishing ? <Progress detail={commitProgress} label="提交到照片库" /> : <><p>{pendingKept.length} 次拍摄已在目标端完成回读校验。</p><p className="result-path">{finalPath}</p><p>确认后提交本批次文件，保留审片会话和已完成记录。</p></>}
+    </Modal>}
+    {resultBatch && <ImportResult batch={resultBatch} onClose={() => setResultBatch(null)} onContinue={() => { setResultBatch(null); setFilter("unreviewed"); }} onResults={() => { setResultBatch(null); setShowHistory(true); }} />}
+    {showHistory && <Modal title="导入记录" onClose={() => setShowHistory(false)}>
+      {history.length ? history.map(batch => <section className="history-batch" key={batch.batchId}><h3>{batch.captureIds.length} 次拍摄 · {batch.files.length} 个文件</h3><p>{new Date(batch.completedAt).toLocaleString("zh-CN")} · {batch.importMode.toUpperCase()}</p><p className="result-path">{batch.destination}</p>
+        <details><summary>查看文件与校验结果</summary><ul>{batch.files.map(file => <li key={file.destination}><strong>{file.originalName}</strong><span>{file.disposition === "alreadyPresent" ? "目标已存在相同文件" : file.disposition === "renamedConflict" ? "重名已安全改名" : "已校验"}</span><code>{file.blake3}</code></li>)}</ul></details></section>) : <p>还没有已完成的导入批次。</p>}
+    </Modal>}
+    {showSettings && <Modal title="审片设置" onClose={() => setShowSettings(false)}><label className="settings-option"><input type="checkbox" checked={autoAdvance} onChange={event => setAutoAdvance(event.target.checked)} />保留或淘汰后自动前进</label><label className="settings-option"><input type="checkbox" checked={showInfo} onChange={event => setShowInfo(event.target.checked)} />显示照片信息</label><label className="settings-option"><input type="checkbox" checked={showHistogram} onChange={event => setShowHistogram(event.target.checked)} />显示 JPEG 直方图</label><p>空格：100% 细节检查 · P：保留 · X：淘汰 · C：比较 · Esc：退出沉浸视图</p></Modal>}
+  </>;
 
   const preview = imageUrl(current?.previewPath ?? null);
   const histogram = useHistogram(current, preview, showHistogram);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (document.querySelector("dialog[open]")) return;
+      if (event.key === "Escape") { setShowDevices(false); setFullScreen(false); return; }
       if (commitInFlight.current) return;
       const target = event.target;
       if (event.isComposing || (target instanceof HTMLElement && (target.isContentEditable || target.closest("input, textarea, select")))) return;
@@ -723,21 +717,20 @@ function App() {
   if (!scan) {
     return (
       <div className="app-shell empty-shell">
-        <header className="topbar empty-header"><Brand /><button aria-label="设置" className="icon-button" title="设置" type="button"><Icons.settings /></button></header>
+        <header className="topbar empty-header" data-tauri-drag-region><Brand /><span className="titlebar-spacer" data-tauri-drag-region /><button aria-label="设置" className="icon-button" title="设置" onClick={() => setShowSettings(true)} type="button"><Icons.settings /></button><WindowControls busy={finishing || transferBusy} onError={setError} onCloseBlocked={() => setError("请先暂停导入并等待当前文件停止，再关闭窗口；审片记录会保留。")} /></header>
         <EmptyWorkspace busy={busy} onOpen={() => void openSource()}>
           <DeviceList devices={devices} warning={deviceWarning} busy={busy} onOpen={openSource} />
         </EmptyWorkspace>
-        {error && <div className="toast error-toast">{error}</div>}
+        {feedback}
       </div>
     );
   }
 
-  const nextCapture = visibleCaptures[Math.min(currentIndex + 1, visibleCaptures.length - 1)] ?? null;
-  const allKeptVerified = kept.length > 0 && kept.every((capture) => transfers[capture.id]?.status === "verified");
+  const allKeptVerified = pendingKept.length > 0 && pendingKept.every((capture) => transfers[capture.id]?.status === "verified");
 
   return (
-    <div className={`app-shell ${fullScreen ? "is-fullscreen" : ""}`} inert={finishing}>
-      <header className="topbar">
+    <div className={`app-shell ${fullScreen ? "is-fullscreen" : ""}`}>
+      <header className="topbar" data-tauri-drag-region>
         <Brand />
         <button className="source-control" disabled={busy} aria-expanded={showDevices} onClick={() => setShowDevices(value => !value)} type="button">
           <Icons.camera size={17} />
@@ -748,7 +741,7 @@ function App() {
           <DeviceList devices={devices} warning={deviceWarning} busy={busy} onOpen={openSource} />
           <button className="primary" disabled={busy} onClick={() => void openSource()} type="button">打开本地文件夹…</button>
         </div>}
-        <div className="top-actions">
+        <span className="titlebar-spacer" data-tauri-drag-region /><div className="top-actions">
           <div className="view-switch" aria-label="视图模式">
             <button aria-label="单张视图" aria-pressed={workspaceMode === "single"} className={workspaceMode === "single" ? "active" : ""} onClick={() => setWorkspaceMode("single")} title="单张视图" type="button"><Icons.aperture /></button>
             <button aria-label="网格视图" aria-pressed={workspaceMode === "grid"} className={workspaceMode === "grid" ? "active" : ""} onClick={() => setWorkspaceMode("grid")} title="网格视图 (G)" type="button"><Icons.grid /></button>
@@ -757,8 +750,9 @@ function App() {
           <span className="top-divider" />
           <button aria-pressed={showInfo} className={showInfo ? "top-tool active" : "top-tool"} onClick={() => setShowInfo((value) => !value)} title="显示照片信息 (I)" type="button"><Icons.info size={17} /><span>信息</span></button>
           <button aria-pressed={showHistogram} className={showHistogram ? "top-tool active" : "top-tool"} onClick={() => setShowHistogram((value) => !value)} title="显示直方图 (H)" type="button"><Icons.histogram size={17} /><span>直方图</span></button>
-          <button aria-label="设置" className="icon-button" title="设置" type="button"><Icons.settings /></button>
+          <button aria-label="设置" className="icon-button" title="设置" onClick={() => setShowSettings(true)} type="button"><Icons.settings /></button>
         </div>
+        <WindowControls busy={finishing || transferBusy} onError={setError} onCloseBlocked={() => setError("请先暂停导入并等待当前文件停止，再关闭窗口；审片记录会保留。")} />
       </header>
 
       <aside className="source-sidebar">
@@ -797,9 +791,9 @@ function App() {
         </div>
 
         {workspaceMode === "grid" ? (
-          <GridView captures={visibleCaptures} currentId={current?.id ?? null} onOpen={(id) => { setCurrentId(id); setWorkspaceMode("single"); }} statusFor={statusFor} rotations={rotations} />
+          <GridView onCompare={(id, slot) => { assignCompare(id, slot); setWorkspaceMode("compare"); }} captures={visibleCaptures} currentId={current?.id ?? null} onOpen={(id) => { setCurrentId(id); setWorkspaceMode("single"); }} statusFor={statusFor} rotations={rotations} />
         ) : workspaceMode === "compare" ? (
-          <CompareView first={current} second={nextCapture} statusFor={statusFor} rotations={rotations} />
+          <CompareView first={scan.captures.find(item => item.id === compareIds[0]) ?? null} second={scan.captures.find(item => item.id === compareIds[1]) ?? null} rotations={rotations} activeSlot={compareSlot} onSlot={setCompareSlot} onReplace={setComparePicker} onSwap={() => setCompareIds(([a, b]) => [b, a])} focus={focusCheck} />
         ) : (
           <section className={`viewer ${focusCheck ? "focus-check" : ""}`}>
             <div className="viewer-stage">
@@ -816,13 +810,13 @@ function App() {
         )}
 
         {current && workspaceMode === "single" && <ExifStrip capture={current} position={`${currentIndex + 1} / ${visibleCaptures.length}`} />}
-        <Filmstrip captures={capturesForDate} currentId={current?.id ?? null} onSelect={setCurrentId} statusFor={statusFor} rotations={rotations} />
+        <Filmstrip captures={capturesForDate} currentId={current?.id ?? null} onSelect={id => workspaceMode === "compare" ? assignCompare(id) : setCurrentId(id)} compareIds={workspaceMode === "compare" ? compareIds : undefined} statusFor={statusFor} rotations={rotations} />
         {current && (
           <div className="decision-bar">
-            <button className="decision reject" disabled={sessionCommitted} onClick={() => mark("reject")} type="button"><Icons.reject /><span>淘汰</span><kbd>X</kbd></button>
-            <button className="decision reset" disabled={sessionCommitted} onClick={() => mark("unreviewed")} type="button"><span>重置</span><kbd>U</kbd></button>
+            <button className="decision reject" disabled={!sessionReady || finishing} onClick={() => mark("reject")} type="button"><Icons.reject /><span>淘汰</span><kbd>X</kbd></button>
+            <button className="decision reset" disabled={!sessionReady || finishing} onClick={() => mark("unreviewed")} type="button"><span>重置</span><kbd>U</kbd></button>
             <StatusMark status={statusFor(current.id)} />
-            <button className="decision keep" disabled={sessionCommitted} onClick={() => mark("keep")} type="button"><Icons.check /><span>保留</span><kbd>P</kbd></button>
+            <button className="decision keep" disabled={!sessionReady || finishing} onClick={() => mark("keep")} type="button"><Icons.check /><span>保留</span><kbd>P</kbd></button>
           </div>
         )}
       </main>
@@ -833,17 +827,17 @@ function App() {
           <section className="inspector-section import-settings">
             <h2>文件格式</h2>
             <div className="import-mode" role="group" aria-label="导入模式">
-              {(["jpeg", "raw", "jpeg+raw"] as ImportMode[]).map((mode) => <button aria-pressed={importMode === mode} className={importMode === mode ? "active" : ""} disabled={sessionCommitted} key={mode} onClick={() => changeImportMode(mode)} type="button">{mode === "jpeg+raw" ? "JPG + RAW" : mode.toUpperCase()}</button>)}
+              {(["jpeg", "raw", "jpeg+raw"] as ImportMode[]).map((mode) => <button aria-pressed={importMode === mode} className={importMode === mode ? "active" : ""} disabled={!sessionReady || finishing} key={mode} onClick={() => changeImportMode(mode)} type="button">{mode === "jpeg+raw" ? "JPG + RAW" : mode.toUpperCase()}</button>)}
             </div>
           </section>
           <section className="inspector-section destination-card">
             <h2>保存位置</h2>
-            <button className="destination-path" disabled={sessionCommitted} onClick={pickDestination} title="选择保存位置" type="button">
+            <button className="destination-path" disabled={!sessionReady || finishing} onClick={pickDestination} title="选择保存位置" type="button">
               <Icons.folder size={16} /><span>{finalPath ?? "选择目标目录"}</span><Icons.chevronRight size={14} />
             </button>
             <label className="shoot-name">
               <span>子文件夹名称</span>
-              <input disabled={sessionCommitted} maxLength={80} onChange={(event) => setShootName(event.target.value)} placeholder="例如：上海街拍" value={shootName} />
+              <input disabled={!sessionReady || finishing} maxLength={80} onChange={(event) => setShootName(event.target.value)} placeholder="例如：上海街拍" value={shootName} />
             </label>
           </section>
           {current && showInfo && (
@@ -868,15 +862,15 @@ function App() {
             </section>
           )}
           <section className="inspector-section queue-section">
-            <h2><span>预导入清单</span><small>{kept.length}</small></h2>
+            <h2><span>导入清单</span><small>{kept.length}</small></h2>
             <div className="queue-list">
               {kept.length === 0 ? (
                 <div className="queue-empty"><Icons.list size={24} /><strong>尚未选择照片</strong><span>按 P 将当前照片加入清单。</span></div>
               ) : kept.map((capture) => {
                 const transfer = transfers[capture.id]?.status ?? "queued";
-                const transferLabels = { queued: "等待目标", copying: "正在复制", verifying: "正在校验", verified: "已校验", committed: "已导入", failed: "失败" };
+                const transferLabels = { queued: destinationRoot ? "等待复制" : "等待目标", copying: "正在复制", verifying: "正在校验", verified: "已校验", committed: "已导入", failed: "失败", cancelled: "已暂停" };
                 return (
-                  <button className={capture.id === current?.id ? "queue-row active" : "queue-row"} key={capture.id} onClick={() => setCurrentId(capture.id)} type="button">
+                  <button title={transfers[capture.id]?.error} className={capture.id === current?.id ? "queue-row active" : "queue-row"} key={capture.id} onClick={() => setCurrentId(capture.id)} type="button">
                     <PhotoPreview capture={capture} rotation={rotations[capture.id]} lazy />
                     <span><strong>{capture.stem}</strong><small>{importMode === "raw" ? formatBytes(capture.raw?.sizeBytes ?? 0) : importMode === "jpeg" ? formatBytes(capture.jpeg?.sizeBytes ?? 0) : formatBytes((capture.jpeg?.sizeBytes ?? 0) + (capture.raw?.sizeBytes ?? 0))}</small></span>
                     <span className={`transfer-state ${transfer}`}><i />{transferLabels[transfer]}</span>
@@ -887,9 +881,11 @@ function App() {
           </section>
         </div>
         <div className="queue-footer">
+          {Object.values(transfers).find(state => state.detail && (state.status === "copying" || state.status === "verifying"))?.detail && <Progress detail={Object.values(transfers).find(state => state.status === "copying" || state.status === "verifying")?.detail ?? null} />}
+          <div className="batch-actions"><button className="text-button" onClick={() => setShowHistory(true)} type="button">导入记录 ({history.length})</button>{transferBusy ? <button className="text-button" type="button" onClick={pause}>暂停导入</button> : (paused || Object.values(transfers).some(state => state.status === "failed" || state.status === "cancelled")) ? <button className="text-button" type="button" onClick={() => { setError(null); retry(); }}>重试未完成</button> : null}</div>
           <div className="import-total"><span>预计导入</span><strong>{formatBytes(queuedBytes)}</strong></div>
           <div><span>选择后自动前进</span><button className={autoAdvance ? "switch on" : "switch"} aria-label="选择后自动前进" aria-pressed={autoAdvance} onClick={() => setAutoAdvance((value) => !value)} type="button"><i /></button></div>
-          <button className="primary finish" disabled={!allKeptVerified || sessionCommitted || finishing} onClick={finishImport} type="button"><span>{finishing ? "正在完成导入…" : sessionCommitted ? "导入已完成" : "完成导入"}</span><small>{sessionCommitted ? `${kept.length} 次拍摄` : `已验证 ${kept.filter((capture) => transfers[capture.id]?.status === "verified").length} / ${kept.length}`}</small></button>
+          <button className="primary finish" disabled={!allKeptVerified || finishing} onClick={finishImport} type="button"><span>{finishing ? "正在完成导入…" : "完成导入"}</span><small>{`已验证 ${kept.filter((capture) => transfers[capture.id]?.status === "verified").length} / ${pendingKept.length}` }</small></button>
         </div>
       </aside>
 
@@ -898,63 +894,50 @@ function App() {
         <div className="shortcut-hints"><span><kbd>P</kbd>保留</span><span><kbd>X</kbd>淘汰</span><span><kbd>R</kbd>右转 · Shift 左转</span><span><kbd>Space</kbd>100% 检查</span><span><kbd>G</kbd>网格</span><span><kbd>F</kbd>全屏</span></div>
         <div role="status">{sourceDisconnected ? "来源已断开，请重新连接同一设备；审片记录仍保留" : scan.sourceName}</div>
       </footer>
-      {error && <div className="toast error-toast">{error}</div>}
-      {notice && <button className="toast notice-toast" onClick={() => setNotice(null)} type="button">{notice}</button>}
+      {feedback}
+      {comparePicker !== null && <Modal title={`选择比较照片 ${comparePicker === 0 ? "A" : "B"}`} onClose={() => setComparePicker(null)}><div className="compare-picker">{scan.captures.map(capture => <button type="button" key={capture.id} onClick={() => assignCompare(capture.id, comparePicker)}><PhotoPreview capture={capture} rotation={rotations[capture.id]} lazy /><span>{capture.stem}</span></button>)}</div></Modal>}
     </div>
   );
 }
 
 function Brand() {
-  return <div className="brand"><strong>RawSift</strong></div>;
+  return <div className="brand" data-tauri-drag-region><strong data-tauri-drag-region>RawSift</strong></div>;
 }
 
-function GridView({ captures, currentId, onOpen, statusFor, rotations }: { captures: Capture[]; currentId: string | null; onOpen: (id: string) => void; statusFor: (id: string) => ReviewStatus; rotations: Record<string, number> }) {
+function GridView({ captures, currentId, onOpen, onCompare, statusFor, rotations }: { captures: Capture[]; currentId: string | null; onOpen: (id: string) => void; onCompare: (id: string, slot: 0 | 1) => void; statusFor: (id: string) => ReviewStatus; rotations: Record<string, number> }) {
   return (
     <section className="grid-view">
       {captures.map((capture, index) => {
         return (
-          <button className={`grid-cell ${capture.id === currentId ? "active" : ""}`} key={capture.id} onDoubleClick={() => onOpen(capture.id)} onClick={() => onOpen(capture.id)} type="button">
+          <div className="grid-item" key={capture.id}><button className={`grid-cell ${capture.id === currentId ? "active" : ""}`} key={capture.id} onDoubleClick={() => onOpen(capture.id)} onClick={() => onOpen(capture.id)} type="button">
             <PhotoPreview capture={capture} rotation={rotations[capture.id]} lazy />
             <span className="grid-index">{String(index + 1).padStart(3, "0")}</span>
             <StatusMark status={statusFor(capture.id)} />
             <span className="grid-name">{capture.stem}<small>{capture.jpeg && capture.raw ? "J+R" : capture.raw ? "RAW" : "JPG"}</small></span>
-          </button>
+          </button><div className="grid-compare-actions"><button type="button" aria-label={`将 ${capture.stem} 设为比较 A`} onClick={() => onCompare(capture.id, 0)}>设为 A</button><button type="button" aria-label={`将 ${capture.stem} 设为比较 B`} onClick={() => onCompare(capture.id, 1)}>设为 B</button></div></div>
         );
       })}
     </section>
   );
 }
 
-function CompareView({ first, second, statusFor, rotations }: { first: Capture | null; second: Capture | null; statusFor: (id: string) => ReviewStatus; rotations: Record<string, number> }) {
-  return (
-    <section className="compare-view">
-      {[first, second].map((capture, index) => {
-        return (
-          <div className="compare-pane" key={index}>
-            {capture ? <PhotoPreview capture={capture} rotation={rotations[capture.id]} /> : <div className="no-preview"><Icons.aperture size={36} /></div>}
-            {capture && <div className="compare-caption"><span>{index === 0 ? "A" : "B"}</span><strong>{capture.stem}</strong><StatusMark status={statusFor(capture.id)} /></div>}
-          </div>
-        );
-      })}
-      <div className="sync-badge">同步查看</div>
-    </section>
-  );
-}
-
-function Filmstrip({ captures, currentId, onSelect, statusFor, rotations }: { captures: Capture[]; currentId: string | null; onSelect: (id: string) => void; statusFor: (id: string) => ReviewStatus; rotations: Record<string, number> }) {
+function Filmstrip({ captures, currentId, onSelect, statusFor, rotations, compareIds }: { captures: Capture[]; currentId: string | null; onSelect: (id: string) => void; compareIds?: [string | null, string | null]; statusFor: (id: string) => ReviewStatus; rotations: Record<string, number> }) {
   const currentIndex = captures.findIndex((capture) => capture.id === currentId);
-  const start = Math.max(0, currentIndex - 6);
+  const [start, setStart] = useState(0);
+  useEffect(() => setStart(Math.max(0, currentIndex - 6)), [currentIndex, captures]);
   const visible = captures.slice(start, start + 14);
   return (
     <nav className="filmstrip" aria-label="照片胶片条">
+      {captures.length > 14 && <button className="film-page" aria-label="上一组胶片" type="button" disabled={start === 0} onClick={() => setStart(value => Math.max(0, value - 12))}><Icons.chevronLeft /></button>}
       {visible.map((capture, index) => {
         return (
           <button className={`film-frame ${capture.id === currentId ? "active" : ""} ${statusFor(capture.id)}`} key={capture.id} onClick={() => onSelect(capture.id)} title={capture.stem} type="button">
             <PhotoPreview capture={capture} rotation={rotations[capture.id]} lazy />
-            <small>{start + index + 1}</small>
+            <small>{compareIds?.[0] === capture.id ? "A" : compareIds?.[1] === capture.id ? "B" : start + index + 1}</small>
           </button>
         );
       })}
+      {captures.length > 14 && <button className="film-page" aria-label="下一组胶片" type="button" disabled={start + 14 >= captures.length} onClick={() => setStart(value => Math.min(captures.length - 14, value + 12))}><Icons.chevronRight /></button>}
     </nav>
   );
 }

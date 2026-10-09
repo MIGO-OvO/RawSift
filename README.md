@@ -45,9 +45,12 @@ when its source returns. Source removal is shown without clearing review decisio
 MTP-only devices show connection guidance: switch the camera to MSC or use a card reader.
 USB mass-storage aliases exposed through WPD are excluded from the MTP list.
 
-The import confirmation uses `dialog:allow-message` (the command used internally by
-the dialog plugin's `confirm`, not a separate confirm permission). Import submission
-is locked through confirmation and commit; cancellation/failure unlocks it for retry.
+Import uses a shared keyboard-accessible modal. Each completed batch leaves the
+review session active; choose more photos or another source, and inspect retained
+file/checksum receipts in Import history. Copy and BLAKE3 readback progress comes
+from actual Rust byte counts; final publication reports completed file counts.
+Pause/retry preserves source files and recoverable staging. Destination/format
+changes cancel old jobs before their results can affect the new batch.
 
 Regression checks: `node tests/import-permissions.mjs`, Rust tests below, and
 `node tests/device-import-regression.mjs` with the same Playwright environment settings
@@ -68,6 +71,8 @@ Checks:
 
 ```powershell
 npm run check
+npx playwright install chromium
+npm run test:ui
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
@@ -78,7 +83,14 @@ See [product decisions](docs/PRODUCT_DECISIONS.md) for the locked scope and safe
 JPEG EXIF orientation is automatic. Use the visible rotate controls, `R` (right), or
 `Shift+R` (left) to rotate locally; this is remembered on this computer and never
 changes source or imported files. Hold Space for 100% JPEG inspection, then release
-to fit the window. Text fields do not trigger review shortcuts.
+to return to the previous view. Double-click or use the comparison toolbar to stay
+at 100%; wheel zoom and drag pan. At high DPI, 100% maps one JPEG pixel to one
+physical display pixel. Text fields and dialogs do not trigger review shortcuts.
+
+Choose A/B freely from grid actions, the filmstrip, or each pane's Replace picker.
+Swap the pair and turn synchronized zoom/pan on or off. Comparison selections stay
+fixed while reviewing. Windows Release uses the GUI subsystem and a custom title
+bar; drag, minimize, maximize/restore and close remain native Tauri operations.
 
 Histograms show 256 bins with RGB/brightness and linear/logarithmic modes. Black/white
 percentages refer to the sampled JPEG preview, not RAW sensor clipping. Desktop
@@ -92,6 +104,11 @@ outside this project, set `PLAYWRIGHT_MODULE` to its absolute package directory;
 `CHROME_PATH` optionally selects an installed Chromium executable. The checks cover
 real JPEG EXIF orientations, fit/rotation, persistence, keyboard focus, window sizes,
 and rapid-navigation analysis counts. Visual output is in `artifacts/review-fixed.png`.
+
+`npm run test:ui` runs all browser/IPC regression suites and manages its own dev
+server. The new CI matrix also tests/builds on Windows, macOS and Linux. See the
+[audit and safety report](docs/AUDIT_2026-10-10.md) for root causes, recovery details,
+verification scope and physical device checks still needed.
 
 ## License
 

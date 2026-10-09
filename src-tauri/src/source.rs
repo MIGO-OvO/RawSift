@@ -98,7 +98,11 @@ pub fn scan_local_source(root: String, recursive: bool) -> Result<ScanResult, So
         .into_iter()
         .filter_entry(should_visit);
 
-    for entry in walker.filter_map(Result::ok) {
+    for entry in walker {
+        // Permission and disconnect failures cannot silently produce a partial
+        // library that looks like a successful scan.
+        let entry =
+            entry.map_err(|error| SourceError::Io(std::io::Error::other(error.to_string())))?;
         if !entry.file_type().is_file() {
             continue;
         }

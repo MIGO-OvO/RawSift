@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { installNativeCallbacks } from './native-mock.mjs';
 
 // Use an existing Playwright installation; no application dependency is needed.
 const require = createRequire(import.meta.url);
@@ -113,6 +114,7 @@ try {
   console.log('PASS: all 8 actual JPEG EXIF orientations applied exactly once');
 
   const desktop = await browser.newPage();
+  await desktop.addInitScript(installNativeCallbacks);
   const scan = await exif.evaluate(async () => (await import('/src/demo.ts')).demoScan);
   await desktop.addInitScript(scan => {
     window.isTauri = true;
@@ -126,7 +128,7 @@ try {
     header.setUint32(14, 40, true); header.setInt32(18, 120, true); header.setInt32(22, -80, true);
     header.setUint16(26, 1, true); header.setUint16(28, 24, true);
     for (let i = 54; i < bmp.length; i += 3) bmp.set([60, 130, 180], i);
-    window.__TAURI_INTERNALS__ = { invoke: async command => {
+    Object.assign(window.__TAURI_INTERNALS__, { invoke: async command => {
       if (command === 'load_last_session') return { sessionId: '00000000-0000-4000-8000-000000000001', sourceRoot: 'fixture', recursive: false, activeDate: '2026-09-04', currentCaptureId: scan.captures[0].id, destinationRoot: null, shootName: '', importMode: 'jpeg', showInfo: true, showHistogram: false, autoAdvance: false, reviews: {}, transfers: {} };
       if (command === 'scan_local_source') return scan;
       if (command === 'preview_thumbnail') {
@@ -136,7 +138,7 @@ try {
         window.activeDecodes--;
         return bmp.buffer;
       }
-    } };
+    } });
   }, scan);
   await desktop.goto(process.env.TEST_URL || 'http://127.0.0.1:1420');
   await desktop.waitForFunction(() => document.querySelectorAll('.film-frame img[src^="blob:"]').length === 8);
