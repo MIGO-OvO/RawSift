@@ -751,8 +751,11 @@ fn capture_staging_directory(
 }
 
 fn safe_relative_folder(value: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(value);
+    // Persisted preferences can move between platforms. Interpret both separators
+    // consistently, and reject Windows drive paths even on Unix hosts.
+    let path = PathBuf::from(value.replace('\\', "/"));
     if path.as_os_str().is_empty()
+        || value.contains(':')
         || path.is_absolute()
         || path
             .components()
@@ -885,8 +888,22 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_destination_subfolders() {
-        assert!(safe_relative_folder(r"2026\2026-09-04").is_ok());
-        assert!(safe_relative_folder(r"..\outside").is_err());
-        assert!(safe_relative_folder(r"C:\outside").is_err());
+        let expected = PathBuf::from("2026").join("2026-09-04");
+        assert_eq!(safe_relative_folder(r"2026\2026-09-04").unwrap(), expected);
+        assert_eq!(safe_relative_folder("2026/2026-09-04").unwrap(), expected);
+        for value in [
+            "",
+            ".",
+            "../outside",
+            r"..\outside",
+            r"2026\..\outside",
+            "/outside",
+            r"\outside",
+            r"C:\outside",
+            "C:outside",
+            r"\\server\share",
+        ] {
+            assert!(safe_relative_folder(value).is_err(), "accepted {value:?}");
+        }
     }
 }
