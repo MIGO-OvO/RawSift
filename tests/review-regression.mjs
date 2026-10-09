@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { expect } from '@playwright/test';
 import { createRequire } from 'node:module';
 import { installNativeCallbacks } from './native-mock.mjs';
 
@@ -11,9 +12,19 @@ const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 async function contained(container, image) {
   await image.waitFor({ state: 'visible' });
-  const stage = await container.boundingBox();
-  const photo = await image.boundingBox();
-  assert(photo.x >= stage.x - 1 && photo.y >= stage.y - 1 && photo.x + photo.width <= stage.x + stage.width + 1 && photo.y + photo.height <= stage.y + stage.height + 1, 'Photo must fit inside its container');
+  // Decode, ResizeObserver and React updates can span multiple frames. Read both
+  // bounds in the same layout and wait for the required geometry, not a fixed delay.
+  await expect(async () => {
+    const bounds = await container.evaluate(host => {
+      const photo = host.querySelector('img');
+      return photo && getComputedStyle(photo).visibility === 'visible'
+        ? { stage: host.getBoundingClientRect().toJSON(), photo: photo.getBoundingClientRect().toJSON() }
+        : null;
+    });
+    assert(bounds, 'Photo must finish decoding and become visible');
+    const { stage, photo } = bounds;
+    assert(photo.x >= stage.x - 1 && photo.y >= stage.y - 1 && photo.x + photo.width <= stage.x + stage.width + 1 && photo.y + photo.height <= stage.y + stage.height + 1, `Photo must fit inside its container: ${JSON.stringify(bounds)}`);
+  }).toPass({ timeout: 5000 });
 }
 try {
   await page.goto(process.env.TEST_URL || 'http://127.0.0.1:1420');
@@ -51,7 +62,6 @@ try {
   await page.keyboard.press('c');
   for (const viewport of [{ width: 1024, height: 640 }, { width: 3992, height: 2200 }, { width: 1600, height: 1000 }]) {
     await page.setViewportSize(viewport);
-    await page.waitForTimeout(100);
     await contained(page.locator('.viewer-stage'), page.locator('.viewer-stage img'));
   }
   await page.screenshot({ path: 'artifacts/review-fixed.png' });
