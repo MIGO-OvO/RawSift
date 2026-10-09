@@ -1,4 +1,5 @@
 use serde::Serialize;
+#[cfg(any(windows, test))]
 use std::path::Path;
 
 #[derive(Debug, Serialize)]
@@ -17,12 +18,14 @@ pub struct Discovery {
     warning: Option<String>,
 }
 
+#[cfg(any(windows, test))]
 fn is_mass_storage_alias(id: &str) -> bool {
     // WPD also lists USB disks (including Sony's PMHOME volume), not just MTP.
     id.to_ascii_lowercase().contains("usbstor#")
 }
 
 // Only probe the standard camera directory, never recursively scan whole disks.
+#[cfg(any(windows, test))]
 fn mounted_camera(root: &Path, label: &str, serial: u32) -> Option<PhotoDevice> {
     let dcim = root.join("DCIM");
     let metadata = std::fs::symlink_metadata(&dcim).ok()?;

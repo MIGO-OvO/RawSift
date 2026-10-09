@@ -19,6 +19,8 @@
     "build": "tauri build",
     "build:web": "tsc --noEmit && vite build",
     "check": "tsc --noEmit",
+    "test:ui": "node tests/run-ui.mjs",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -28,6 +30,7 @@
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.0",
     "@tauri-apps/cli": "2.11.4",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
@@ -36,4 +39,3 @@
     "vite": "8.2.2"
   }
 }
-

@@ -63,8 +63,23 @@ export interface ScanResult {
 }
 
 export interface TransferState {
-  status: "queued" | "copying" | "verifying" | "verified" | "committed" | "failed";
+  status: "queued" | "copying" | "verifying" | "verified" | "committed" | "failed" | "cancelled";
   progress: number;
   speedBytesPerSecond?: number;
   error?: string;
+  detail?: TransferProgress;
 }
+
+export interface TransferProgress {
+  operationId: string;
+  captureId: string;
+  phase: "copying" | "verifying" | "committing";
+  fileName: string;
+  bytesProcessed: number;
+  totalBytes: number;
+  filesCompleted: number;
+  totalFiles: number;
+  speedBytesPerSecond: number;
+}
+
+export interface ViewTransform { zoom: "fit" | number; x: number; y: number }

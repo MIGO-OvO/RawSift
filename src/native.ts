@@ -1,4 +1,4 @@
-import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type {
   ImportMode,
@@ -6,6 +6,7 @@ import type {
   ReviewStatus,
   ScanResult,
   TransferState,
+  TransferProgress,
 } from "./types";
 import { demoScan } from "./demo";
 
@@ -92,11 +93,16 @@ export interface PersistedSession {
   autoAdvance: boolean;
   reviews: Record<string, ReviewStatus>;
   transfers: Record<string, TransferState>;
+  pendingBatchId?: string;
 }
 
 export async function loadLastSession(): Promise<PersistedSession | null> {
   if (!isTauri()) return null;
   return invoke<PersistedSession | null>("load_last_session");
+}
+
+export async function loadSourceSession(sourceRoot: string): Promise<PersistedSession | null> {
+  return isTauri() ? invoke("load_source_session", { sourceRoot }) : null;
 }
 
 export async function saveSessionSnapshot(snapshot: PersistedSession): Promise<void> {
@@ -132,6 +138,8 @@ export interface StageCaptureRequest {
   destinationRoot: string;
   sessionId: string;
   importMode: ImportMode;
+  operationId: string;
+  sourceRoot: string;
 }
 
 export interface StagedAsset {
@@ -154,8 +162,33 @@ export interface CommitResult {
   persistenceWarning: string | null;
 }
 
-export async function stageCapture(request: StageCaptureRequest): Promise<StagedAsset[]> {
-  return invoke<StagedAsset[]>("stage_capture", { request });
+export interface ImportBatch {
+  batchId: string;
+  sessionId: string;
+  sourceRoot: string;
+  destination: string;
+  importMode: ImportMode;
+  captureIds: string[];
+  files: CommittedFile[];
+  completedAt: string;
+}
+
+export async function loadImportHistory(): Promise<ImportBatch[]> {
+  return isTauri() ? invoke("load_import_history") : [];
+}
+
+export async function cancelTransfer(operationId: string): Promise<void> {
+  if (isTauri()) await invoke("cancel_transfer", { operationId });
+}
+
+export async function discardBatch(destinationRoot: string, sessionId: string): Promise<void> {
+  if (isTauri()) await invoke("discard_batch", { request: { destinationRoot, sessionId } });
+}
+
+export async function stageCapture(request: StageCaptureRequest, onProgress: (progress: TransferProgress) => void): Promise<StagedAsset[]> {
+  const channel = new Channel<TransferProgress>();
+  channel.onmessage = onProgress;
+  return invoke<StagedAsset[]>("stage_capture", { request, onProgress: channel });
 }
 
 export async function unstageCapture(
@@ -175,9 +208,15 @@ export async function commitSession(
   relativeFolder: string,
   captureIds: string[],
   importMode: ImportMode,
+  reviewSessionId: string,
+  sourceRoot: string,
+  onProgress: (progress: TransferProgress) => void,
 ): Promise<CommitResult> {
+  const channel = new Channel<TransferProgress>();
+  channel.onmessage = onProgress;
   return invoke<CommitResult>("commit_session", {
-    request: { destinationRoot, sessionId, relativeFolder, captureIds, importMode },
+    request: { destinationRoot, sessionId, relativeFolder, captureIds, importMode, reviewSessionId, sourceRoot },
+    onProgress: channel,
   });
 }
 

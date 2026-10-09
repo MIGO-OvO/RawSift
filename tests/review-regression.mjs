@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { expect } from '@playwright/test';
 import { createRequire } from 'node:module';
+import { installNativeCallbacks } from './native-mock.mjs';
 
 // Use an existing Playwright installation; no application dependency is needed.
 const require = createRequire(import.meta.url);
@@ -10,9 +12,19 @@ const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 async function contained(container, image) {
   await image.waitFor({ state: 'visible' });
-  const stage = await container.boundingBox();
-  const photo = await image.boundingBox();
-  assert(photo.x >= stage.x - 1 && photo.y >= stage.y - 1 && photo.x + photo.width <= stage.x + stage.width + 1 && photo.y + photo.height <= stage.y + stage.height + 1, 'Photo must fit inside its container');
+  // Decode, ResizeObserver and React updates can span multiple frames. Read both
+  // bounds in the same layout and wait for the required geometry, not a fixed delay.
+  await expect(async () => {
+    const bounds = await container.evaluate(host => {
+      const photo = host.querySelector('img');
+      return photo && getComputedStyle(photo).visibility === 'visible'
+        ? { stage: host.getBoundingClientRect().toJSON(), photo: photo.getBoundingClientRect().toJSON() }
+        : null;
+    });
+    assert(bounds, 'Photo must finish decoding and become visible');
+    const { stage, photo } = bounds;
+    assert(photo.x >= stage.x - 1 && photo.y >= stage.y - 1 && photo.x + photo.width <= stage.x + stage.width + 1 && photo.y + photo.height <= stage.y + stage.height + 1, `Photo must fit inside its container: ${JSON.stringify(bounds)}`);
+  }).toPass({ timeout: 5000 });
 }
 try {
   await page.goto(process.env.TEST_URL || 'http://127.0.0.1:1420');
@@ -50,7 +62,6 @@ try {
   await page.keyboard.press('c');
   for (const viewport of [{ width: 1024, height: 640 }, { width: 3992, height: 2200 }, { width: 1600, height: 1000 }]) {
     await page.setViewportSize(viewport);
-    await page.waitForTimeout(100);
     await contained(page.locator('.viewer-stage'), page.locator('.viewer-stage img'));
   }
   await page.screenshot({ path: 'artifacts/review-fixed.png' });
@@ -113,6 +124,7 @@ try {
   console.log('PASS: all 8 actual JPEG EXIF orientations applied exactly once');
 
   const desktop = await browser.newPage();
+  await desktop.addInitScript(installNativeCallbacks);
   const scan = await exif.evaluate(async () => (await import('/src/demo.ts')).demoScan);
   await desktop.addInitScript(scan => {
     window.isTauri = true;
@@ -126,7 +138,7 @@ try {
     header.setUint32(14, 40, true); header.setInt32(18, 120, true); header.setInt32(22, -80, true);
     header.setUint16(26, 1, true); header.setUint16(28, 24, true);
     for (let i = 54; i < bmp.length; i += 3) bmp.set([60, 130, 180], i);
-    window.__TAURI_INTERNALS__ = { invoke: async command => {
+    Object.assign(window.__TAURI_INTERNALS__, { invoke: async command => {
       if (command === 'load_last_session') return { sessionId: '00000000-0000-4000-8000-000000000001', sourceRoot: 'fixture', recursive: false, activeDate: '2026-09-04', currentCaptureId: scan.captures[0].id, destinationRoot: null, shootName: '', importMode: 'jpeg', showInfo: true, showHistogram: false, autoAdvance: false, reviews: {}, transfers: {} };
       if (command === 'scan_local_source') return scan;
       if (command === 'preview_thumbnail') {
@@ -136,7 +148,7 @@ try {
         window.activeDecodes--;
         return bmp.buffer;
       }
-    } };
+    } });
   }, scan);
   await desktop.goto(process.env.TEST_URL || 'http://127.0.0.1:1420');
   await desktop.waitForFunction(() => document.querySelectorAll('.film-frame img[src^="blob:"]').length === 8);

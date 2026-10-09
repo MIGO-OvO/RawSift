@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { installNativeCallbacks } from './native-mock.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const browser = await chromium.launch({ headless: true, ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
@@ -10,11 +11,12 @@ const saved = { sessionId: '00000000-0000-4000-8000-000000000001', sourceRoot: '
 async function setup(options = {}) {
   const page = await browser.newPage({ viewport: { width: 1024, height: 640 } });
   const errors = [];
+  await page.addInitScript(installNativeCallbacks);
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(({ options }) => {
     window.isTauri = true;
     window.testState = { devices: [], calls: [], unavailable: false, answer: '继续审片', commitError: false, ...options };
-    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+    Object.assign(window.__TAURI_INTERNALS__, { invoke: async (command, args) => {
       const state = window.testState;
       state.calls.push({ command, args });
       if (command === 'load_last_session') return state.saved || null;
@@ -37,7 +39,7 @@ async function setup(options = {}) {
         return { files: [{ destination: 'F:\\Photos\\DSC00001.ARW' }], persistenceWarning: null };
       }
       return null;
-    } };
+    } });
   }, { options });
   await page.goto(url);
   return { page, errors };
@@ -85,18 +87,26 @@ try {
   await resume.page.waitForFunction(() => document.querySelector('.finish')?.disabled === false);
   const finish = resume.page.locator('.finish');
   await finish.click();
+  await resume.page.getByRole('dialog').getByRole('button', { name: '继续审片', exact: true }).click();
   await resume.page.waitForFunction(() => document.querySelector('.finish')?.disabled === false);
   assert.equal(await count(resume.page, 'commit_session'), 0, 'Cancel must not commit');
   await resume.page.evaluate(() => { window.testState.answer = '完成导入'; window.testState.commitError = true; });
   await finish.click();
-  await resume.page.getByText('目标设备不可用', { exact: true }).waitFor();
+  await resume.page.getByRole('dialog').getByRole('button', { name: '完成导入', exact: true }).click();
+  await resume.page.getByText(/完成导入失败.*目标设备不可用/).waitFor();
   assert.equal(await finish.isEnabled(), true, 'Failure releases lock for retry');
   await resume.page.evaluate(() => { window.testState.commitError = false; });
   await finish.evaluate(button => { button.click(); button.click(); button.click(); });
-  await resume.page.getByText('导入已完成', { exact: true }).waitFor();
+  await resume.page.getByRole('dialog').getByRole('button', { name: '完成导入', exact: true }).evaluate(button => { button.click(); button.click(); });
+  await resume.page.getByRole('dialog', { name: '导入完成', exact: true }).waitFor();
   assert.equal(await count(resume.page, 'commit_session'), 2, 'Rapid clicks produce only one additional commit');
   assert.equal(await resume.page.locator('.error-toast').count(), 0, 'Successful retry clears stale error');
   assert.deepEqual(resume.errors, []);
+  await resume.page.getByRole('button', { name: '继续导入', exact: true }).click();
+  await resume.page.getByRole('dialog').waitFor({ state: 'hidden' });
+  assert.equal(await finish.isEnabled(), false, 'Already completed captures cannot be submitted again');
+  await resume.page.getByRole('button', { name: /^全部/ }).click();
+  assert.equal(await resume.page.locator('.decision.keep').isEnabled(), true, 'Completed batches keep the review session usable');
   await resume.page.locator('.source-control').click();
   await resume.page.screenshot({ path: 'artifacts/device-import-1024.png' });
   console.log('PASS: hotplug, multiple devices, no session takeover, disconnect/reconnect, MTP guidance, saved-session recovery, cancel, failure/retry and duplicate-submit protection (mocked IPC)');
